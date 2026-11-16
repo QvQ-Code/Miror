@@ -8,6 +8,7 @@ from miror.adb_host import is_usb_device, parse_devices, parse_wm_size
 from miror.session import LatestFrame
 from miror.support import agent_jar
 from miror.annexb import AccessUnitAssembler, nal_type, to_annexb
+from miror.playback import AacStream, PcmPlayer, PcmQueue
 from miror.protocol import HEADER, KIND_CONFIG, KIND_FRAME, Packet, PacketQueue, pack_packet, unpack_header
 from miror.scale import bitrate_for, clean_half, fit_1080p, light_bitrate, present_box
 from miror.touch import TouchPort, map_touch, oriented_panel
@@ -182,6 +183,53 @@ class AdbParseTests(unittest.TestCase):
     def test_wm_size_prefers_override(self) -> None:
         text = "Physical size: 1080x2400\nOverride size: 720x1600\n"
         self.assertEqual(parse_wm_size(text), (720, 1600))
+
+
+class AudioQueueTests(unittest.TestCase):
+    def test_pcm_queue_drops_oldest(self) -> None:
+        queued = PcmQueue(limit=3)
+        queued.push(b"")
+        self.assertEqual(len(queued), 0)
+        queued.push(b"a")
+        queued.push(b"b")
+        queued.push(b"c")
+        queued.push(b"d")
+        self.assertEqual(len(queued), 3)
+        self.assertEqual(queued.pop(), b"b")
+        self.assertEqual(queued.pop(), b"c")
+        self.assertEqual(queued.pop(), b"d")
+        self.assertIsNone(queued.pop())
+
+    def test_player_write_drops_without_opening_waveout(self) -> None:
+        player = PcmPlayer()
+        player.write(b"abc")
+        self.assertTrue(player._pending.empty())
+        for index in range(10):
+            player.write(bytes([index]) * 4)
+        self.assertEqual(player._pending.qsize(), 8)
+        self.assertEqual(player._pending.get_nowait(), bytes([2]) * 4)
+
+    def test_aac_config_decodes_to_stereo_pcm(self) -> None:
+        import av
+
+        encoder = av.CodecContext.create("aac", "w")
+        encoder.sample_rate = 48000
+        encoder.layout = "stereo"
+        encoder.format = "fltp"
+        encoder.bit_rate = 128000
+        encoder.open()
+        frame = av.AudioFrame(format="fltp", layout="stereo", samples=960)
+        frame.sample_rate = 48000
+        frame.pts = 0
+        packets = list(encoder.encode(frame)) + list(encoder.encode(None))
+        stream = AacStream()
+        self.assertEqual(stream.chunks(1, b"\x11\x90"), [])
+        pcm = b""
+        for packet in packets:
+            for chunk in stream.chunks(2, bytes(packet)):
+                pcm += chunk
+        self.assertGreaterEqual(len(pcm), 4)
+        self.assertEqual(len(pcm) % 4, 0)
 
 
 if __name__ == "__main__":

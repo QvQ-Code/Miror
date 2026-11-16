@@ -72,6 +72,16 @@ Decode satu thread. Dua thread sempat membuat 856 jatuh. Gambar lama yang sudah 
 
 Pengguna sudah bilang jalur 856 ini lebih baik. Belum ada angka pojok baru yang dikunci sebagai 60.
 
+## Audio
+
+Socket kedua `localabstract:miror-audio`. Gambar tetap di socket `miror` dan tidak menunggu suara. Buffer kirim audio 64 KB. Encoder video, bitrate, interval, pace, dan buffer video tidak diubah untuk suara.
+
+Ponsel menangkap suara pemutaran, bukan mikrofon. Di sesi 16 November 2026 jalur yang hidup adalah AudioPolicy loopback untuk usage media, game, unknown, dan sonification. Encode AAC-LC stereo 48 kHz, 128 kbps. Log ponsel `audio siap` dan `MIROR_AUDIO_READY`. PC mendecode di thread sendiri dan memutar lewat waveOut. `audio jalan` berarti PCM pertama sudah masuk. Kalau shell ditolak, log `audio ditolak` dan di PC `audio tidak diizinkan ponsel`. Gambar tetap jalan.
+
+Aplikasi yang membungkam tangkapan, sering yang ber-DRM, tetap bisa diam. Itu batas izin aplikasi.
+
+Sesi coba pada 544, mode 0, 12.915.723 bps: `audio jalan` muncul bersama kirim gambar. Angka pojok tidak dikunci dari sesi ini. Exe rilis v1.0.0 belum memuat audio.
+
 ## Yang jangan dikembalikan
 
 - Interval 0, repeat 33333, sleep sepanjang pace, operating-rate 90
@@ -80,6 +90,8 @@ Pengguna sudah bilang jalur 856 ini lebih baik. Belum ada angka pojok baru yang 
 - 640×1440 dan 464×1040 sebagai ukuran tombol
 - `adb reconnect`, menghapus kunci USB debugging, `cmd statusbar expand-notifications`, `input swipe` sebagai pengganti sentuhan
 - Buffer 64 KB pada 424/544, dan buffer 1 MB pada 424/544
+- Audio di socket video, atau menahan gambar supaya selaras dengan suara
+- Mikrofon sebagai pengganti kalau tangkapan pemutaran ditolak
 
 ## Berkas
 

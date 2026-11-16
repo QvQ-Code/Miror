@@ -77,6 +77,7 @@ public final class Agent {
     private Metrics cachedMetrics;
     private long metricsAt;
     private volatile boolean metricsDirty = true;
+    private AudioMirror audio;
 
     public Agent(int maxLong, int maxShort, int capFps, int sizeTier) {
         this.maxLong = maxLong;
@@ -169,6 +170,8 @@ public final class Agent {
         Log.line("listening");
         System.out.println("MIROR_READY");
         System.out.flush();
+        audio = new AudioMirror();
+        audio.start(context);
         armAcceptWatchdog();
 
         Object socket = Ref.call(server, "accept", new Class<?>[0], new Object[0]);
@@ -905,6 +908,10 @@ public final class Agent {
 
     private void cleanup() {
         running = false;
+        if (audio != null) {
+            audio.stop();
+            audio = null;
+        }
         if (wakeLock != null) {
             try {
                 Ref.call(wakeLock, "release", new Class<?>[0], new Object[0]);

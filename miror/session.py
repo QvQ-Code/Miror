@@ -20,6 +20,7 @@ from miror.protocol import (
     StreamClosed,
     read_packet,
 )
+from miror.playback import AacStream, PcmPlayer
 from miror.scale import bitrate_for, fit_1080p, present_box
 from miror.support import agent_jar, log
 from miror.touch import TouchPort
@@ -138,15 +139,25 @@ class MirrorSession(QObject):
         self.draw_size = (0, 0)
         self.panel = (0, 0)
         self.touch = TouchPort()
+        self._audio_denied = threading.Event()
+        self._audio_ready = threading.Event()
+        self._audio_sock = None
+        self._audio_port = 0
+        self._audio_thread: threading.Thread | None = None
 
     def start(self, serial: str, fps: int = 60, tier: int = 1) -> None:
         if self.running:
             return
+        leftover = self._audio_thread
+        if leftover is not None and leftover.is_alive() and leftover is not threading.current_thread():
+            leftover.join(0.3)
         self.serial = serial
         self.fps_cap = 30 if int(fps) <= 30 else 60
         self.size_tier = tier if int(tier) in (2, 3) else 1
         self.running = True
         self._stop.clear()
+        self._audio_denied.clear()
+        self._audio_ready.clear()
         self._thread = threading.Thread(target=self._run, name="miror-session", daemon=True)
         self._thread.start()
 
@@ -156,9 +167,15 @@ class MirrorSession(QObject):
         with self._lock:
             sock = self._sock
             proc = self._proc
+            audio = self._audio_sock
         if sock is not None:
             try:
                 sock.close()
+            except OSError:
+                pass
+        if audio is not None:
+            try:
+                audio.close()
             except OSError:
                 pass
         if proc is not None:
@@ -201,6 +218,9 @@ class MirrorSession(QObject):
         finally:
             self.touch.close()
             self._cleanup_agent()
+            audio_thread = self._audio_thread
+            if audio_thread is not None and audio_thread is not threading.current_thread():
+                audio_thread.join(0.8)
             self.running = False
             if error:
                 self.failed.emit(error)
@@ -248,6 +268,10 @@ class MirrorSession(QObject):
                     pass
             if text == "MIROR_READY":
                 ready.set()
+            if text == "MIROR_AUDIO_READY":
+                self._audio_ready.set()
+            if "audio ditolak" in text:
+                self._audio_denied.set()
             if text.startswith("MIROR_FAIL"):
                 failed.set()
 
@@ -280,6 +304,8 @@ class MirrorSession(QObject):
             raise RuntimeError(last_error or "Socket mirror tidak terbuka")
         with self._lock:
             self._sock = sock
+        self._audio_thread = threading.Thread(target=self._play_audio, name="miror-audio", daemon=True)
+        self._audio_thread.start()
         self.status.emit("Mirror jalan")
         self._decode_socket(sock)
         if failed.is_set() and not self._stop.is_set():
@@ -440,6 +466,106 @@ class MirrorSession(QObject):
                 break
         thread.join(timeout=1)
 
+    def _play_audio(self) -> None:
+        """Second socket. This thread never waits on the picture, and the picture never waits on it."""
+
+        player = None
+        sock = None
+        port = 0
+        try:
+            if not self._wait_audio_gate():
+                return
+            port = self.adb.forward(self.serial, "localabstract:miror-audio")
+            with self._lock:
+                self._audio_port = port
+            log(f"forward tcp:{port} -> localabstract:miror-audio")
+            sock = self._connect_audio(port)
+            if sock is None:
+                return
+            with self._lock:
+                self._audio_sock = sock
+            player = PcmPlayer()
+            player.start()
+            decoder = AacStream()
+            heard = False
+            while not self._stop.is_set():
+                try:
+                    packet = read_packet(sock, self._stop)
+                except StreamClosed:
+                    break
+                except (OSError, ValueError) as exc:
+                    if not self._stop.is_set():
+                        log(f"audio stream {exc}")
+                    break
+                if packet.kind == KIND_EOS:
+                    break
+                if packet.kind not in (KIND_CONFIG, KIND_FRAME):
+                    continue
+                try:
+                    chunks = decoder.chunks(packet.kind, packet.payload)
+                except Exception as exc:
+                    log(f"audio decode {exc}")
+                    continue
+                for pcm in chunks:
+                    if not heard:
+                        heard = True
+                        log("audio jalan")
+                    player.write(pcm)
+        except Exception as exc:
+            if not self._stop.is_set():
+                log(f"audio {exc}")
+        finally:
+            if player is not None:
+                player.close()
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            with self._lock:
+                if self._audio_sock is sock:
+                    self._audio_sock = None
+                if port and self._audio_port == port:
+                    self._audio_port = 0
+                else:
+                    port = 0
+            if port and self.serial:
+                try:
+                    self.adb.remove_forward(self.serial, port)
+                except Exception:
+                    pass
+
+    def _wait_audio_gate(self) -> bool:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self._audio_denied.is_set():
+                log("audio tidak diizinkan ponsel")
+                return False
+            if self._audio_ready.is_set():
+                return True
+            time.sleep(0.05)
+        if self._stop.is_set():
+            return False
+        if self._audio_denied.is_set():
+            log("audio tidak diizinkan ponsel")
+            return False
+        log("audio tidak tersambung")
+        return False
+
+    def _connect_audio(self, port: int):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not self._stop.is_set():
+            if self._audio_denied.is_set():
+                log("audio tidak diizinkan ponsel")
+                return None
+            try:
+                return self.adb.connect_local(port, timeout=0.2)
+            except OSError:
+                time.sleep(0.1)
+        if not self._stop.is_set() and not self._audio_denied.is_set():
+            log("audio tidak tersambung")
+        return None
+
     def _cleanup_agent(self) -> None:
         with self._lock:
             sock = self._sock
@@ -449,9 +575,18 @@ class MirrorSession(QObject):
             port = self._port
             pid = self._pid
             self._port = 0
+            audio = self._audio_sock
+            audio_port = self._audio_port
+            self._audio_sock = None
+            self._audio_port = 0
         if sock is not None:
             try:
                 sock.close()
+            except OSError:
+                pass
+        if audio is not None:
+            try:
+                audio.close()
             except OSError:
                 pass
         if proc is not None:
@@ -467,6 +602,11 @@ class MirrorSession(QObject):
             if port:
                 try:
                     self.adb.remove_forward(self.serial, port)
+                except Exception:
+                    pass
+            if audio_port:
+                try:
+                    self.adb.remove_forward(self.serial, audio_port)
                 except Exception:
                     pass
 
