@@ -5,13 +5,13 @@ from __future__ import annotations
 import unittest
 
 from miror.adb_host import is_usb_device, parse_devices, parse_wm_size
-from miror.session import LatestFrame
+from miror.session import LatestFrame, paint_index
 from miror.support import agent_jar
 from miror.annexb import AccessUnitAssembler, nal_type, to_annexb
 from miror.playback import AacStream, PcmPlayer, PcmQueue
 from miror.protocol import HEADER, KIND_CONFIG, KIND_FRAME, Packet, PacketQueue, pack_packet, unpack_header
 from miror.scale import bitrate_for, clean_half, fit_1080p, light_bitrate, present_box
-from miror.touch import TouchPort, map_touch, oriented_panel
+from miror.touch import TouchPort, keyboard_line, map_touch, oriented_panel
 
 
 class ScaleTests(unittest.TestCase):
@@ -66,7 +66,95 @@ class ScaleTests(unittest.TestCase):
         port.down(1, 2)
         port.move(3, 4)
         port.up(5, 6)
+        port.keys(b"input text 'a'\n")
         port.close()
+
+    def test_keyboard_lines_leave_the_phone_keyboard_alone(self) -> None:
+        self.assertEqual(keyboard_line("a"), b"input keyboard text 'a'\n")
+        self.assertEqual(keyboard_line(" "), b"input keyboard text ' '\n")
+        self.assertEqual(keyboard_line("%"), b"input keyboard text '%'\n")
+        self.assertEqual(keyboard_line("'"), b"input keyboard text ''\\'''\n")
+        self.assertEqual(keyboard_line(special="backspace"), b"input keyevent KEYCODE_DEL\n")
+        enter = keyboard_line(special="enter") or b""
+        self.assertIn(b"mInputShown=true && input keyevent KEYCODE_BACK", enter)
+        self.assertIn(b"input keyboard keyevent KEYCODE_ENTER", enter)
+        self.assertEqual(keyboard_line(special="back"), b"input keyevent KEYCODE_BACK\n")
+        self.assertEqual(
+            keyboard_line("a", ctrl=True),
+            b"input keycombination KEYCODE_CTRL_LEFT KEYCODE_A\n",
+        )
+        self.assertEqual(
+            keyboard_line(special="left", shift=True),
+            b"input keycombination KEYCODE_SHIFT_LEFT KEYCODE_DPAD_LEFT\n",
+        )
+        self.assertIsNone(keyboard_line(""))
+        self.assertIsNone(keyboard_line("\n"))
+        self.assertNotIn(b"ime ", keyboard_line("a") or b"")
+
+    def test_paint_index_colors_only_the_newest_new_frame(self) -> None:
+        batch = [
+            Packet(KIND_FRAME, 0, 1, 856, 1904, b"a"),
+            Packet(KIND_FRAME, 0, 2, 856, 1904, b"b"),
+            Packet(KIND_FRAME, 0, 3, 856, 1904, b"c"),
+        ]
+        self.assertEqual(paint_index(batch, b"", False, (856, 1904)), 2)
+
+    def test_paint_index_skips_a_repeat_of_the_shown_picture(self) -> None:
+        batch = [
+            Packet(KIND_FRAME, 0, 1, 856, 1904, b"same"),
+            Packet(KIND_FRAME, 0, 2, 856, 1904, b"same"),
+        ]
+        self.assertIsNone(paint_index(batch, b"same", False, (856, 1904)))
+
+    def test_paint_index_colors_the_first_copy_of_a_new_picture(self) -> None:
+        batch = [
+            Packet(KIND_FRAME, 0, 1, 856, 1904, b"old"),
+            Packet(KIND_FRAME, 0, 2, 856, 1904, b"new"),
+            Packet(KIND_FRAME, 0, 3, 856, 1904, b"new"),
+        ]
+        self.assertEqual(paint_index(batch, b"old", False, (856, 1904)), 1)
+
+    def test_paint_index_waits_for_a_key_after_a_break(self) -> None:
+        batch = [
+            Packet(KIND_FRAME, 0, 1, 856, 1904, b"p"),
+            Packet(KIND_FRAME, 1, 2, 856, 1904, b"key"),
+            Packet(KIND_FRAME, 0, 3, 856, 1904, b"next"),
+        ]
+        self.assertEqual(paint_index(batch, b"", True, (856, 1904)), 2)
+
+    def test_856_shrink_matches_the_reformatter(self) -> None:
+        import numpy as np
+
+        from miror.decode import Decoder
+
+        decoder = Decoder()
+        height, width = 240, 128
+        yuv = np.full((height * 3 // 2, width), 140, dtype=np.uint8)
+        yuv[height:, :] = 128
+        yuv[20:80, 10:70] = 30
+        frame = decoder._av.VideoFrame.from_ndarray(yuv, format="yuv420p")
+        copied = bytes(decoder._to_rgb(frame, 96, 180))
+        self.assertEqual((decoder.width, decoder.height), (96, 180))
+        direct = decoder._reformatter.reformat(
+            frame,
+            width=96,
+            height=180,
+            format="rgb24",
+            src_colorspace=decoder._space.ITU709,
+            src_color_range=decoder._range.JPEG,
+            interpolation=decoder._area,
+            threads=2,
+        )
+        self.assertEqual(copied, direct.to_ndarray().tobytes())
+
+    def test_full_frame_stays_at_544(self) -> None:
+        from miror.decode import Decoder
+
+        decoder = Decoder()
+        frame = decoder._av.VideoFrame(544, 1208, "yuv420p")
+        rgb = decoder._to_rgb(frame)
+        self.assertEqual((decoder.width, decoder.height), (544, 1208))
+        self.assertEqual(len(rgb), 544 * 1208 * 3)
 
     def test_present_box_leaves_424_and_544_alone(self) -> None:
         self.assertEqual(present_box(424, 960, 424, 960), (0, 0))

@@ -23,11 +23,28 @@ from PySide6.QtWidgets import (
 
 from miror.adb_host import AdbHost, Device
 from miror.session import MirrorSession
-from miror.support import app_icon
-from miror.touch import map_touch
+from miror.support import app_icon, log
+from miror.touch import keyboard_line, map_touch
 
 _WIDGET_MAX = 16777215
 _TIER_FRAME = {1: (424, 960), 2: (544, 1208), 3: (856, 1920)}
+_PHONE_KEYS = {
+    Qt.Key.Key_Backspace: "backspace",
+    Qt.Key.Key_Delete: "delete",
+    Qt.Key.Key_Return: "enter",
+    Qt.Key.Key_Enter: "enter",
+    Qt.Key.Key_Tab: "tab",
+    Qt.Key.Key_Left: "left",
+    Qt.Key.Key_Right: "right",
+    Qt.Key.Key_Up: "up",
+    Qt.Key.Key_Down: "down",
+    Qt.Key.Key_Home: "home",
+    Qt.Key.Key_End: "end",
+    Qt.Key.Key_PageUp: "pageup",
+    Qt.Key.Key_PageDown: "pagedown",
+    Qt.Key.Key_Escape: "back",
+    Qt.Key.Key_CapsLock: "caps",
+}
 
 
 def blit_rgb888(target: QImage, source: bytearray, width: int, height: int) -> None:
@@ -59,9 +76,11 @@ class FrameView(QWidget):
         super().__init__()
         self._image: QImage | None = None
         self.handler = None
+        self.key_handler = None
         self.setMinimumSize(1, 1)
         self.setMouseTracking(True)
         self.setAutoFillBackground(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self.handler is not None:
@@ -88,6 +107,12 @@ class FrameView(QWidget):
         if self.handler is not None:
             self.handler(event)
         event.accept()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self.key_handler is not None and self.key_handler(event):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def set_frame(self, image: QImage | None) -> None:
         self._image = image
@@ -191,6 +216,7 @@ class MainWindow(QMainWindow):
         self.fps_cap = 60
         self.size_tier = 2
         self.show_fps = True
+        self._hud_log_at = 0.0
         self._finger = False
         self._last_touch = 0.0
         self._last_point: tuple[int, int] | None = None
@@ -204,6 +230,7 @@ class MainWindow(QMainWindow):
                 app.setWindowIcon(icon)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._build()
         self.session.status.connect(self.status.setText)
         self.session.failed.connect(self._on_failed)
@@ -294,6 +321,15 @@ class MainWindow(QMainWindow):
         self.fps_toggle.toggled.connect(self._on_fps_toggled)
         row.addWidget(self.fps_toggle)
 
+        self.audio_btn = QPushButton("Suara")
+        self.audio_btn.setObjectName("fps")
+        self.audio_btn.setCheckable(True)
+        self.audio_btn.setChecked(True)
+        self.audio_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.audio_btn.setFixedHeight(22)
+        self.audio_btn.toggled.connect(self._on_audio_toggled)
+        row.addWidget(self.audio_btn)
+
         self.start_btn = QPushButton("Mulai")
         self.start_btn.setObjectName("start")
         self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -329,7 +365,23 @@ class MainWindow(QMainWindow):
 
         self.view = FrameView()
         self.view.handler = self._view_mouse
+        self.view.key_handler = self._phone_key
         layout.addWidget(self.view, 1)
+        for widget in (
+            self.size_424,
+            self.size_544,
+            self.size_856,
+            self.fps_30,
+            self.fps_60,
+            self.fps_toggle,
+            self.audio_btn,
+            self.start_btn,
+            self.stop_btn,
+            self.devices,
+            self.min_btn,
+            self.close_btn,
+        ):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.fps_hud = QLabel(self.view)
         self.fps_hud.setObjectName("fpsHud")
@@ -405,7 +457,9 @@ class MainWindow(QMainWindow):
         self.fps_hud.raise_()
 
     def _set_fps_readout(self, fps: int) -> None:
-        text = f"{int(fps)} fps"
+        fps = int(fps)
+        self._note_hud_fps(fps)
+        text = f"{fps} fps"
         if self.fps_hud.text() != text:
             self.fps_hud.setText(text)
             self._place_fps_hud()
@@ -415,6 +469,20 @@ class MainWindow(QMainWindow):
         if not self.fps_hud.isVisible():
             self.fps_hud.show()
             self.fps_hud.raise_()
+
+    def _note_hud_fps(self, fps: int) -> None:
+        """Write the corner number, once a second, while a mirror is running."""
+
+        if not self.session.running:
+            return
+        now = time.monotonic()
+        if now - self._hud_log_at < 1.0:
+            return
+        self._hud_log_at = now
+        log(f"hud {int(fps)} fps")
+
+    def _on_audio_toggled(self, checked: bool) -> None:
+        self.session.set_audio(bool(checked))
 
     def _on_fps_toggled(self, checked: bool) -> None:
         self.show_fps = bool(checked)
@@ -668,6 +736,7 @@ class MainWindow(QMainWindow):
         self.status.setText("Menyambungkan...")
         self.session.start(device.serial, self.fps_cap, self.size_tier)
         self.timer.start()
+        self.view.setFocus()
         self._sync_buttons()
 
     def stop_mirror(self) -> None:
@@ -749,6 +818,43 @@ class MainWindow(QMainWindow):
         self.devices.setEnabled(not running)
         if not running:
             self.devices.setVisible(len(self._devices) > 1)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self._phone_key(event):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _phone_key(self, event) -> bool:
+        if not self.session.running:
+            return False
+        key = event.key()
+        if key == Qt.Key.Key_F11:
+            return False
+        if key == Qt.Key.Key_Escape and self.isFullScreen():
+            return False
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        special = _PHONE_KEYS.get(key, "")
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12 and key != Qt.Key.Key_F11:
+            special = f"f{key - int(Qt.Key.Key_F1) + 1}"
+        text = event.text()
+        if ctrl or alt or (shift and special):
+            if Qt.Key.Key_A <= key <= Qt.Key.Key_Z or Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+                text = chr(int(key))
+            elif key == Qt.Key.Key_Space:
+                text = " "
+            line = keyboard_line(text, special, ctrl=ctrl, alt=alt, shift=shift)
+        elif special:
+            line = keyboard_line(special=special)
+        else:
+            line = keyboard_line(text=text)
+        if line is None:
+            return False
+        self.session.touch.keys(line)
+        return True
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():

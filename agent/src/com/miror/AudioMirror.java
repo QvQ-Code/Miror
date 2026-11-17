@@ -39,6 +39,7 @@ final class AudioMirror {
     private Object audioManager;
     private OutputStream output;
     private boolean configSent;
+    private final ByteBuffer headerBuf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
 
     private Method dequeueInput;
     private Method getInputBuffer;
@@ -90,27 +91,65 @@ final class AudioMirror {
     }
 
     private void capture(Object context) throws Exception {
-        record = openRecord(context);
-        if (record == null) {
-            Log.line("audio ditolak");
-            return;
-        }
-        codec = openEncoder();
-        bindCodec();
+        // Listen first. The recorder and encoder stay closed until a PC
+        // connects, and they close again when that PC drops the socket.
+        // The picture thread never shares this work.
         Class<?> serverClass = Ref.cls("android.net.LocalServerSocket");
         server = serverClass.getConstructor(String.class).newInstance("miror-audio");
         Log.line("audio siap");
         System.out.println("MIROR_AUDIO_READY");
         System.out.flush();
-        Object socket = Ref.call(server, "accept", new Class<?>[0], new Object[0]);
-        if (!running) {
-            return;
+        while (running) {
+            Object socket;
+            try {
+                socket = Ref.call(server, "accept", new Class<?>[0], new Object[0]);
+            } catch (Throwable ex) {
+                if (running) {
+                    Log.line("audio " + ex);
+                }
+                return;
+            }
+            if (!running || socket == null) {
+                return;
+            }
+            boolean again = true;
+            try {
+                again = serve(context, socket);
+            } catch (java.io.IOException closed) {
+                again = running;
+            } catch (Throwable ex) {
+                if (running) {
+                    Log.line("audio " + ex);
+                }
+                again = false;
+            } finally {
+                releaseCapture();
+                try {
+                    Ref.call(socket, "close", new Class<?>[0], new Object[0]);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (!again || !running) {
+                return;
+            }
+            Log.line("audio jeda");
         }
+    }
+
+    private boolean serve(Object context, Object socket) throws Exception {
         try {
             Ref.call(socket, "setSendBufferSize", new Class<?>[] {int.class}, new Object[] {64 * 1024});
         } catch (Throwable ignored) {
         }
         output = (OutputStream) Ref.call(socket, "getOutputStream", new Class<?>[0], new Object[0]);
+        record = openRecord(context);
+        if (record == null) {
+            Log.line("audio ditolak");
+            return false;
+        }
+        codec = openEncoder();
+        bindCodec();
+        configSent = false;
         byte[] pcm = new byte[PCM_BYTES];
         long pts = 0L;
         while (running) {
@@ -131,6 +170,7 @@ final class AudioMirror {
             }
             drain();
         }
+        return running;
     }
 
     private Object openRecord(Object context) {
@@ -371,16 +411,16 @@ final class AudioMirror {
         if (stream == null || payload == null) {
             return;
         }
-        ByteBuffer header = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
-        header.putInt(payload.length);
-        header.put((byte) kind);
-        header.put((byte) 0);
-        header.putShort((short) 0);
-        header.putLong(pts);
-        header.putInt(SAMPLE_RATE);
-        header.putInt(CHANNELS);
+        headerBuf.clear();
+        headerBuf.putInt(payload.length);
+        headerBuf.put((byte) kind);
+        headerBuf.put((byte) 0);
+        headerBuf.putShort((short) 0);
+        headerBuf.putLong(pts);
+        headerBuf.putInt(SAMPLE_RATE);
+        headerBuf.putInt(CHANNELS);
         synchronized (lock) {
-            stream.write(header.array());
+            stream.write(headerBuf.array());
             stream.write(payload);
             stream.flush();
         }
@@ -398,9 +438,14 @@ final class AudioMirror {
     }
 
     private void release() {
-        output = null;
+        releaseCapture();
         closeServer();
         server = null;
+    }
+
+    private void releaseCapture() {
+        output = null;
+        configSent = false;
         if (record != null) {
             try {
                 Ref.call(record, "stop", new Class<?>[0], new Object[0]);

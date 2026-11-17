@@ -59,6 +59,8 @@ public final class Agent {
     private int windowFrames;
     private long paceAt;
     private long paceNs = 16_666_667L;
+    private boolean preciseWait;
+    private final ByteBuffer headerBuf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
     private byte[] heldData;
     private boolean heldKey;
     private long heldPts;
@@ -153,6 +155,7 @@ public final class Agent {
                     new Class<?>[] {int.class}, new Object[] {-8});
         } catch (Throwable ignored) {
         }
+        relaxClock();
 
         int sdk = 0;
         try {
@@ -305,27 +308,20 @@ public final class Agent {
         if (dropUntilKey) {
             return catchUp();
         }
-        // Spin only when the encoder has nothing ready. A frame that is already
-        // encoded must not wait out the rest of the slot.
+        // Do not take a picture out early. That frees an encoder buffer, the
+        // next picture is made during the same slot, and the third one is
+        // dropped until an intra. The drop is the flicker on the clean sizes.
         if (light && heldData != null && paceAt != 0L && System.nanoTime() < paceAt
                 && (pending == null || sizeTier == 3)) {
-            if (pending != null) {
+            if (preciseWait || pending != null) {
+                coast(paceAt);
+            } else {
                 long target = paceAt;
                 while (System.nanoTime() < target) {
                 }
-            } else {
-                Unit early = readUnit(0L);
-                if (early == null) {
-                    // Thread.sleep on an idle phone can return 80 ms or even 5 s late.
-                    long target = paceAt;
-                    while (System.nanoTime() < target) {
-                    }
-                    long late = System.nanoTime() - target;
-                    if (late > lateMaxNs) {
-                        lateMaxNs = late;
-                    }
-                } else {
-                    pending = early;
+                long late = System.nanoTime() - target;
+                if (late > lateMaxNs) {
+                    lateMaxNs = late;
                 }
             }
         }
@@ -364,20 +360,10 @@ public final class Agent {
                     extra = newer;
                     continue;
                 }
-                if (sizeTier == 3) {
-                    // A fresh intra at this size is a few hundred KB and the
-                    // fps drops while it is sent. Keep the extra picture.
-                    pending = newer;
-                    break;
-                }
-                // A third picture is already sitting in the encoder. Sending
-                // the whole pile blocks the PC. Drop until a fresh intra.
-                dropUntilKey = true;
-                requestSync(codec);
-                if (jumpMax < 1000) {
-                    jumpMax++;
-                }
-                return catchUp();
+                // One extra picture waits for the next slot. Dropping it until
+                // an intra breaks the reference and the clean picture flickers.
+                pending = newer;
+                break;
             }
         }
         int burst = 0;
@@ -423,8 +409,15 @@ public final class Agent {
                 paceAt = System.nanoTime() + paceNs;
                 return true;
             }
-            long target = System.nanoTime() + 2_000_000L;
-            while (System.nanoTime() < target) {
+            if (preciseWait) {
+                try {
+                    Thread.sleep(2L);
+                } catch (InterruptedException ignored) {
+                }
+            } else {
+                long target = System.nanoTime() + 2_000_000L;
+                while (System.nanoTime() < target) {
+                }
             }
             return false;
         }
@@ -679,18 +672,64 @@ public final class Agent {
         if (payload == null) {
             payload = new byte[0];
         }
-        ByteBuffer header = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
-        header.putInt(payload.length);
-        header.put((byte) kind);
-        header.put((byte) flags);
-        header.putShort((short) 0);
-        header.putLong(pts);
-        header.putInt(width);
-        header.putInt(height);
+        headerBuf.clear();
+        headerBuf.putInt(payload.length);
+        headerBuf.put((byte) kind);
+        headerBuf.put((byte) flags);
+        headerBuf.putShort((short) 0);
+        headerBuf.putLong(pts);
+        headerBuf.putInt(width);
+        headerBuf.putInt(height);
         synchronized (writeLock) {
-            output.write(header.array());
+            output.write(headerBuf.array());
             output.write(payload);
             output.flush();
+        }
+    }
+
+    /**
+     * Pin this thread's timer so a codec wait stays near the pace slot.
+     * Without that pin, a sleep on this phone has returned tens of milliseconds
+     * late, so the old path spun the whole slot instead.
+     */
+    private void relaxClock() {
+        preciseWait = false;
+        try {
+            Class<?> os = Ref.cls("android.system.Os");
+            Ref.callStatic(os, "prctl",
+                    new Class<?>[] {int.class, long.class, long.class, long.class, long.class},
+                    new Object[] {Integer.valueOf(29), Long.valueOf(1L), Long.valueOf(0L),
+                            Long.valueOf(0L), Long.valueOf(0L)});
+            preciseWait = true;
+        } catch (Throwable ignored) {
+        }
+        if (preciseWait) {
+            try {
+                Class<?> process = Ref.cls("android.os.Process");
+                Object tid = Ref.callStatic(process, "myTid", new Class<?>[0], new Object[0]);
+                // Foreground group, not top-app. The mirrored app keeps the top slot.
+                Ref.callStatic(process, "setThreadGroup",
+                        new Class<?>[] {int.class, int.class},
+                        new Object[] {tid, Integer.valueOf(1)});
+            } catch (Throwable ignored) {
+            }
+        }
+        Log.line(preciseWait ? "pace wait=slot" : "pace wait=spin");
+    }
+
+    private void coast(long target) {
+        long left = target - System.nanoTime();
+        if (preciseWait && left > 3_000_000L) {
+            try {
+                Thread.sleep((left - 2_000_000L) / 1_000_000L);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        while (System.nanoTime() < target) {
+        }
+        long late = System.nanoTime() - target;
+        if (late > lateMaxNs) {
+            lateMaxNs = late;
         }
     }
 

@@ -26,6 +26,38 @@ from miror.support import agent_jar, log
 from miror.touch import TouchPort
 
 
+def paint_index(batch, last_payload: bytes, wait_key: bool, size: tuple[int, int]) -> int | None:
+    """Which frame in this already-queued batch should be colored.
+
+    Older new frames stay in the batch so the reference can be decoded.
+    A repeat of a payload already decoded is not colored again. Frames
+    that are not in the batch yet are left for the next turn.
+    """
+
+    chosen = None
+    payload = last_payload
+    waiting = wait_key
+    current = size
+    for index, packet in enumerate(batch):
+        if packet.width and packet.height and (packet.width, packet.height) != current:
+            current = (packet.width, packet.height)
+            payload = b""
+            waiting = False
+        if packet.kind == KIND_CONFIG:
+            payload = b""
+            continue
+        if waiting and (packet.flags & FLAG_KEY) == 0:
+            continue
+        width = packet.width or current[0]
+        height = packet.height or current[1]
+        if packet.payload == payload and width > 0 and height > 0:
+            continue
+        chosen = index
+        payload = packet.payload
+        waiting = False
+    return chosen
+
+
 class LatestFrame:
     """The newest RGB picture.
 
@@ -139,6 +171,7 @@ class MirrorSession(QObject):
         self.draw_size = (0, 0)
         self.panel = (0, 0)
         self.touch = TouchPort()
+        self.audio_on = True
         self._audio_denied = threading.Event()
         self._audio_ready = threading.Event()
         self._audio_sock = None
@@ -304,8 +337,8 @@ class MirrorSession(QObject):
             raise RuntimeError(last_error or "Socket mirror tidak terbuka")
         with self._lock:
             self._sock = sock
-        self._audio_thread = threading.Thread(target=self._play_audio, name="miror-audio", daemon=True)
-        self._audio_thread.start()
+        if self.audio_on:
+            self._start_audio_thread()
         self.status.emit("Mirror jalan")
         self._decode_socket(sock)
         if failed.is_set() and not self._stop.is_set():
@@ -393,6 +426,7 @@ class MirrorSession(QObject):
         self._boost()
         current = (0, 0)
         last_payload = b""
+        shown_payload = b""
         wait_key = False
         while not stop.is_set():
             item = queue.pop(0.3)
@@ -405,66 +439,117 @@ class MirrorSession(QObject):
                 decoder.reset()
                 current = (packet.width, packet.height)
                 last_payload = b""
+                shown_payload = b""
+                wait_key = False
+            # Take the frames already waiting. Do not keep pulling frames
+            # that arrive while this batch is decoded, or one slow picture
+            # swallows the rest and the corner drops into the teens.
+            batch = [packet]
+            while True:
+                newer = queue.pop(0)
+                if newer is None:
+                    break
+                batch.append(newer[0])
+            current, last_payload, shown_payload, wait_key = self._present_batch(
+                decoder, batch, current, last_payload, shown_payload, wait_key
+            )
+        thread.join(timeout=1)
+
+    def _present_batch(self, decoder, batch, current, last_payload, shown_payload, wait_key):
+        chosen = paint_index(batch, last_payload, wait_key, current)
+        for index, packet in enumerate(batch):
+            if packet.width and packet.height and (packet.width, packet.height) != current:
+                decoder.reset()
+                current = (packet.width, packet.height)
+                last_payload = b""
+                shown_payload = b""
                 wait_key = False
             if packet.kind == KIND_CONFIG:
                 decoder.decode(packet.payload, packet.pts, render=False)
                 last_payload = b""
                 continue
-            while True:
-                if packet.kind == KIND_CONFIG:
-                    decoder.decode(packet.payload, packet.pts, render=False)
-                    last_payload = b""
-                    break
-                if wait_key and (packet.flags & FLAG_KEY) == 0:
-                    break
-                width = packet.width or decoder.width
-                height = packet.height or decoder.height
-                # Same bytes as the picture already on screen. Count it for the
-                # fps number and do not decode or copy it again.
-                if packet.payload == last_payload and width > 0 and height > 0:
+            if wait_key and (packet.flags & FLAG_KEY) == 0:
+                continue
+            width = packet.width or current[0]
+            height = packet.height or current[1]
+            # Same bytes as a picture already decoded. Count it only when
+            # that picture is the one on screen, and do not decode it again.
+            if packet.payload == last_payload and width > 0 and height > 0:
+                if packet.payload == shown_payload:
                     self.frames.tick()
-                    break
-                newer = queue.pop(0)
-                if newer is not None:
-                    # This picture is already old. Keep the reference and color
-                    # only the newest one, or 856 spends the slot on a stale frame.
-                    skipped = decoder.decode(packet.payload, packet.pts, render=False)
-                    if skipped is None:
-                        wait_key = True
-                        last_payload = b""
-                        packet = newer[0]
-                        continue
-                    last_payload = packet.payload
-                    packet = newer[0]
-                    if (packet.width, packet.height) != current and packet.width and packet.height:
-                        decoder.reset()
-                        current = (packet.width, packet.height)
-                        last_payload = b""
-                        wait_key = False
-                    continue
-                src_w = packet.width or current[0] or width
-                src_h = packet.height or current[1] or height
+                continue
+            src_w = packet.width or current[0] or width
+            src_h = packet.height or current[1] or height
+            if index == chosen:
                 box_w, box_h = present_box(src_w, src_h, *self.draw_size)
                 rgb = decoder.decode(packet.payload, packet.pts, out_w=box_w, out_h=box_h)
-                if rgb is None:
-                    wait_key = True
-                    last_payload = b""
-                    break
-                wait_key = False
-                label_w = src_w or decoder.width
-                label_h = src_h or decoder.height
-                last_payload = packet.payload
-                if not rgb or label_w <= 0 or label_h <= 0:
-                    break
-                self.frames.push(
-                    rgb,
-                    decoder.width or label_w,
-                    decoder.height or label_h,
-                    label_w,
-                    label_h,
-                )
-                break
-        thread.join(timeout=1)
+            else:
+                rgb = decoder.decode(packet.payload, packet.pts, render=False)
+            if rgb is None:
+                wait_key = True
+                last_payload = b""
+                continue
+            last_payload = packet.payload
+            wait_key = False
+            if index != chosen or not rgb:
+                continue
+            label_w = src_w or decoder.width
+            label_h = src_h or decoder.height
+            if label_w <= 0 or label_h <= 0:
+                continue
+            shown_payload = packet.payload
+            self.frames.push(
+                rgb,
+                decoder.width or label_w,
+                decoder.height or label_h,
+                label_w,
+                label_h,
+            )
+        return current, last_payload, shown_payload, wait_key
+
+    def set_audio(self, enabled: bool) -> None:
+        """Play or stop phone audio. The picture keeps its own socket either way."""
+
+        enabled = bool(enabled)
+        self.audio_on = enabled
+        if not self.running:
+            log("audio nyala" if enabled else "audio mati")
+            return
+        if enabled:
+            self._start_audio_thread()
+        else:
+            self._drop_audio()
+
+    def _audio_wanted(self) -> bool:
+        return self.audio_on and not self._stop.is_set()
+
+    def _start_audio_thread(self) -> None:
+        if not self._audio_wanted() or not self.running:
+            return
+        if self._audio_denied.is_set():
+            log("audio tidak diizinkan ponsel")
+            return
+        with self._lock:
+            current = self._audio_thread
+            if current is not None and current.is_alive():
+                return
+            thread = threading.Thread(target=self._play_audio, name="miror-audio", daemon=True)
+            self._audio_thread = thread
+        log("audio nyala")
+        thread.start()
+
+    def _drop_audio(self) -> None:
+        with self._lock:
+            audio = self._audio_sock
+        if audio is not None:
+            try:
+                audio.close()
+            except OSError:
+                pass
+        thread = self._audio_thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(0.8)
+        log("audio mati")
 
     def _play_audio(self) -> None:
         """Second socket. This thread never waits on the picture, and the picture never waits on it."""
@@ -473,7 +558,7 @@ class MirrorSession(QObject):
         sock = None
         port = 0
         try:
-            if not self._wait_audio_gate():
+            if not self._audio_wanted() or not self._wait_audio_gate():
                 return
             port = self.adb.forward(self.serial, "localabstract:miror-audio")
             with self._lock:
@@ -488,13 +573,13 @@ class MirrorSession(QObject):
             player.start()
             decoder = AacStream()
             heard = False
-            while not self._stop.is_set():
+            while self._audio_wanted():
                 try:
                     packet = read_packet(sock, self._stop)
                 except StreamClosed:
                     break
                 except (OSError, ValueError) as exc:
-                    if not self._stop.is_set():
+                    if self._audio_wanted():
                         log(f"audio stream {exc}")
                     break
                 if packet.kind == KIND_EOS:
@@ -512,7 +597,7 @@ class MirrorSession(QObject):
                         log("audio jalan")
                     player.write(pcm)
         except Exception as exc:
-            if not self._stop.is_set():
+            if self._audio_wanted():
                 log(f"audio {exc}")
         finally:
             if player is not None:
@@ -537,14 +622,14 @@ class MirrorSession(QObject):
 
     def _wait_audio_gate(self) -> bool:
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not self._stop.is_set():
+        while time.monotonic() < deadline and self._audio_wanted():
             if self._audio_denied.is_set():
                 log("audio tidak diizinkan ponsel")
                 return False
             if self._audio_ready.is_set():
                 return True
             time.sleep(0.05)
-        if self._stop.is_set():
+        if not self._audio_wanted():
             return False
         if self._audio_denied.is_set():
             log("audio tidak diizinkan ponsel")
@@ -554,7 +639,7 @@ class MirrorSession(QObject):
 
     def _connect_audio(self, port: int):
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not self._stop.is_set():
+        while time.monotonic() < deadline and self._audio_wanted():
             if self._audio_denied.is_set():
                 log("audio tidak diizinkan ponsel")
                 return None
@@ -562,7 +647,9 @@ class MirrorSession(QObject):
                 return self.adb.connect_local(port, timeout=0.2)
             except OSError:
                 time.sleep(0.1)
-        if not self._stop.is_set() and not self._audio_denied.is_set():
+        if not self._audio_wanted():
+            return None
+        if not self._audio_denied.is_set():
             log("audio tidak tersambung")
         return None
 

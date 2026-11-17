@@ -57,6 +57,13 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(window.view.width(), 700)
         self.assertEqual(window.view.height(), 320)
         self.assertTrue(window.fps_toggle.isChecked())
+        self.assertTrue(window.audio_btn.isChecked())
+        self.assertTrue(window.session.audio_on)
+        self.assertEqual(window.audio_btn.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        window.audio_btn.setChecked(False)
+        self.assertFalse(window.session.audio_on)
+        window.audio_btn.setChecked(True)
+        self.assertTrue(window.session.audio_on)
         self.assertTrue(app_icon().is_file())
         self.assertFalse(window.windowIcon().isNull())
         window.fps_toggle.setChecked(False)
@@ -84,6 +91,40 @@ class WindowTests(unittest.TestCase):
         self.assertLess(color.green(), 5)
         self.assertLess(color.blue(), 5)
         window.close()
+
+    def test_corner_fps_is_logged_once_a_second(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        from miror.ui import MainWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow(start_adb=False)
+        notes: list[str] = []
+        window.session.running = True
+        window._hud_log_at = 0.0
+        original = __import__("miror.ui", fromlist=["log"]).log
+        try:
+            import miror.ui as ui
+
+            ui.log = notes.append
+            window._set_fps_readout(40)
+            window._set_fps_readout(18)
+            self.assertEqual(notes, ["hud 40 fps"])
+            self.assertEqual(window.fps_hud.text(), "18 fps")
+            window._hud_log_at = 0.0
+            window._set_fps_readout(18)
+            self.assertEqual(notes, ["hud 40 fps", "hud 18 fps"])
+            window.session.running = False
+            window._hud_log_at = 0.0
+            window._set_fps_readout(12)
+            self.assertEqual(notes, ["hud 40 fps", "hud 18 fps"])
+        finally:
+            import miror.ui as ui
+
+            ui.log = original
+            window.close()
+        app.processEvents()
 
     def _check_drag_and_touch(self, window) -> None:
         from PySide6.QtCore import QEvent, QPointF, Qt
@@ -131,6 +172,9 @@ class WindowTests(unittest.TestCase):
             def close(self) -> None:
                 return None
 
+            def keys(self, line: bytes) -> None:
+                self.events.append(("key", line))
+
         recorder = Recorder()
         window.session.touch = recorder
         window.session.running = True
@@ -154,7 +198,40 @@ class WindowTests(unittest.TestCase):
         app.sendEvent(window.view, mouse(QEvent.Type.MouseButtonPress, (0, view_h / 2), left))
         self.assertEqual(recorder.events, [])
         self.assertFalse(window._finger)
+        from PySide6.QtGui import QKeyEvent
+
+        app.sendEvent(
+            window.view,
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier, "a"),
+        )
+        app.sendEvent(
+            window.view,
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Backspace, Qt.KeyboardModifier.NoModifier),
+        )
+        app.sendEvent(
+            window.view,
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_A,
+                Qt.KeyboardModifier.ControlModifier,
+                "\x01",
+            ),
+        )
+        self.assertEqual(
+            recorder.events,
+            [
+                ("key", b"input keyboard text 'a'\n"),
+                ("key", b"input keyevent KEYCODE_DEL\n"),
+                ("key", b"input keycombination KEYCODE_CTRL_LEFT KEYCODE_A\n"),
+            ],
+        )
         window.session.running = False
+        recorder.events.clear()
+        app.sendEvent(
+            window,
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier, "a"),
+        )
+        self.assertEqual(recorder.events, [])
 
 
 if __name__ == "__main__":

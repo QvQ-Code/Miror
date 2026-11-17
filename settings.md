@@ -1,12 +1,12 @@
 # Setting Miror saat ini
 
-Disimpan 16 November 2026. Ini gambaran keseluruhan yang sedang dipakai. `checkpoint.md` mengunci gambar bersih 424 dan 544. `resolution.md` mengunci tiga ukuran. File ini menggabungkan keduanya plus jalur 856 yang sudah terasa lebih baik.
+Disimpan 17 November 2026. Ini gambaran keseluruhan yang sedang dipakai. `checkpoint.md` mengunci gambar bersih 424 dan 544. `resolution.md` mengunci tiga ukuran. File ini menggabungkan keduanya plus jalur 856 yang sudah terasa lebih baik.
 
 Nama aplikasinya Miror. Jendela, paket, dan exe memakai nama itu.
 
 HP: Nubia 8150N, layar 1080×2408, density 480, Android 13, encoder `c2.unisoc.avc.encoder`. Layar PC ini 1920×1080 pada 100%. 1080p artinya kotak 1920×1080. Gambar terbesar HP ini di dalam kotak itu adalah 856×1920. Encoder sering langsung menyesuaikan sisi panjang 1920 menjadi 1904.
 
-USB saja. Tidak ada nirkabel. Satu perangkat USB menyembunyikan daftar ponsel. Klik pada gambar adalah tap. Tahan lalu geser adalah sentuhan yang sama, termasuk membuka bilah status. Koordinatnya piksel layar (`wm size`), lewat satu shell `input motionevent` yang tetap hidup. Bukan perintah `cmd statusbar`.
+USB saja. Tidak ada nirkabel. Satu perangkat USB menyembunyikan daftar ponsel. Klik pada gambar adalah tap. Tahan lalu geser adalah sentuhan yang sama, termasuk membuka bilah status. Koordinatnya piksel layar (`wm size`), lewat satu shell `input motionevent` yang tetap hidup. Bukan perintah `cmd statusbar`. Keyboard PC memakai shell yang sama. Huruf lewat `input keyboard text`, tombol khusus lewat `input keyevent`. Ketukan dari mirror yang membuka keyboard sistem ditutup lagi dengan Back hanya kalau keyboard itu sedang tampil. Jari di ponsel tidak lewat jalur ini, jadi keyboard ponsel tetap muncul. Enter menutup keyboard sistem kalau sedang tampil, lalu mengirim Enter. Escape pada jendela biasa mengirim Back. Saat layar penuh, Escape hanya mengecilkan jendela. F11 tetap hanya untuk jendela PC.
 
 ## Jendela
 
@@ -50,11 +50,11 @@ Mode 0 yang hidup di HP ini. Kunci warna dan profile hanya di mode 0, supaya con
 
 ## Kirim dari ponsel
 
-Pace `1_000_000_000 / fps`, dihitung setelah setiap gambar light. Sisa waktu di-spin, bukan `Thread.sleep`. Layar diam tidak menghasilkan 60 frame dari encoder, jadi `emitHeld` mengirim ulang gambar terakhir yang utuh.
+Pace `1_000_000_000 / fps`, dihitung setelah setiap gambar light. Slot yang belum waktunya tidak mengambil gambar dari encoder. Kalau jam thread berhasil dipatok, sisa waktu di-`Thread.sleep` sampai 2 ms terakhir, lalu spin singkat. Bukan sleep sepanjang slot. Mengambil gambar lebih awal mengosongkan buffer dan encoder membuat gambar lain dalam slot yang sama. Gambar ketiga tidak dibuang: dibuang-sampai-intra membuat 424 dan 544 berkedip. Gambar yang sudah ada di ukuran 856 tetap menunggu slotnya. Kalau jam tidak bisa dipatok, sisa waktu tetap di-spin. Layar diam tidak menghasilkan 60 frame dari encoder, jadi `emitHeld` mengirim ulang gambar terakhir yang utuh.
 
 Satu putaran mengirim paling banyak dua gambar.
 
-- Ukuran 424 dan 544: gambar ketiga memicu `request-sync`, antrean lama dibuang sampai intra berikutnya. Buffer kirim 64 KB.
+- Ukuran 424 dan 544: gambar ketiga disimpan untuk slot berikutnya, sama seperti 856. Tidak dibuang dan tidak meminta intra dadakan, karena buang-sampai-intra membuat gambar berkedip. Buffer kirim 64 KB.
 - Ukuran 856: gambar ketiga disimpan di `pending` dan dikirim di slot pace berikutnya. Tidak ada intra dadakan. Buffer kirim 1 MB, karena gambar 856 sering lebih besar dari 64 KB dan tulisannya sempat macet.
 
 P-frame dikirim berurutan. Membuang P-frame merusak referensi. Gambar yang dipegang boleh P-frame, bukan hanya intra. Byte yang sama tidak didecode dua kali.
@@ -63,18 +63,21 @@ PC: `TCP_NODELAY`, buffer terima 1 MB. Antrean paket 24. Intra baru mengganti an
 
 ## Gambar di PC
 
-Decode satu thread. Dua thread sempat membuat 856 jatuh. Gambar lama yang sudah ketinggalan didecode tanpa warna supaya referensi tetap. Gambar terbaru selalu diubah ke RGB888.
+Decode satu thread. Dua thread sempat membuat 856 jatuh. Frame yang sudah menunggu diambil sekali. Gambar lama di tumpukan itu didecode tanpa warna supaya referensi tetap. Gambar terbaru yang belum tampil diubah ke RGB888. Frame yang datang saat kerja itu menunggu giliran berikutnya, supaya satu gambar lambat tidak menelan sisanya.
 
-- 424 dan 544: bitmap penuh, scale halus hanya kalau jendela tidak sama persis dengan gambar.
-- 856, sisi panjang di atas 1400, dan jendela lebih kecil pada orientasi yang sama: warna langsung dibuat sebesar kotak jendela (bicubic), lalu ditempel 1:1. Tulisan status tetap ukuran encoder.
+- 424 dan 544: bitmap penuh, scale halus hanya kalau jendela tidak sama persis dengan gambar. Tidak lewat kotak kecil.
+- 856, sisi panjang di atas 1400, dan jendela lebih kecil pada orientasi yang sama: warna langsung dibuat sebesar kotak jendela (area averaging, scaler 2 thread), lalu ditempel 1:1. Decoder tetap 1 thread. Tulisan status tetap ukuran encoder.
 - Gambar yang sudah muat di area kerja setelah tinggi header dikurangi tidak diperkecil. Landscape 1904×856 di layar 1920×1080 tampil 1:1 dan menempel ke tepi kiri-kanan. Portrait 856×1904 lebih tinggi dari sisa layar, jadi lewat kotak jendela. Tidak ada jarak ekstra 24/48 di tepi.
 - Jangan menaikkan angka pojok dengan menghitung frame yang tidak digambar.
+- Angka yang sama dengan badge pojok ditulis ke `%LOCALAPPDATA%\Miror\miror.log` sekali per detik selama mirror jalan, berbentuk `hud 24 fps`. Menyembunyikan badge tidak menghentikan baris itu.
 
 Pengguna sudah bilang jalur 856 ini lebih baik. Belum ada angka pojok baru yang dikunci sebagai 60.
 
 ## Audio
 
 Socket kedua `localabstract:miror-audio`. Gambar tetap di socket `miror` dan tidak menunggu suara. Buffer kirim audio 64 KB. Encoder video, bitrate, interval, pace, dan buffer video tidak diubah untuk suara.
+
+Tombol header `Suara` menyalakan atau mematikan saluran ini tanpa menghentikan gambar. Default menyala. Mati menutup socket di PC. Ponsel membuka perekam hanya setelah PC tersambung, dan menutup perekam lagi saat socket putus. Log ponsel untuk putus itu `audio jeda`. Menyalakan lagi menyambung ke server audio yang masih menunggu.
 
 Ponsel menangkap suara pemutaran, bukan mikrofon. Di sesi 16 November 2026 jalur yang hidup adalah AudioPolicy loopback untuk usage media, game, unknown, dan sonification. Encode AAC-LC stereo 48 kHz, 128 kbps. Log ponsel `audio siap` dan `MIROR_AUDIO_READY`. PC mendecode di thread sendiri dan memutar lewat waveOut. `audio jalan` berarti PCM pertama sudah masuk. Kalau shell ditolak, log `audio ditolak` dan di PC `audio tidak diizinkan ponsel`. Gambar tetap jalan.
 
@@ -92,6 +95,7 @@ Sesi coba pada 544, mode 0, 12.915.723 bps: `audio jalan` muncul bersama kirim g
 - Buffer 64 KB pada 424/544, dan buffer 1 MB pada 424/544
 - Audio di socket video, atau menahan gambar supaya selaras dengan suara
 - Mikrofon sebagai pengganti kalau tangkapan pemutaran ditolak
+- Mematikan keyboard virtual ponsel, atau memunculkannya dari tombol PC
 
 ## Berkas
 
